@@ -11,6 +11,9 @@
 (define-constant ERR_INSUFFICIENT_BALANCE (err u1005))
 (define-constant ERR_ORACLE_UPDATE_TOO_RECENT (err u1006))
 (define-constant ERR_PRICE_TOO_OLD (err u1007))
+(define-constant ERR_INSUFFICIENT_STAKE (err u1008))
+(define-constant ERR_EMERGENCY_ACTIVE (err u1009))
+(define-constant ERR_EMERGENCY_INACTIVE (err u1010))
 
 (define-constant COLLATERAL_RATIO u150)
 (define-constant LIQUIDATION_RATIO u120)
@@ -22,6 +25,10 @@
 (define-data-var last-price-update uint u0)
 (define-data-var total-supply uint u0)
 (define-data-var total-collateral uint u0)
+(define-data-var total-staked uint u0)
+(define-data-var reward-rate-per-block uint u100)
+(define-data-var vault-admin principal CONTRACT_OWNER)
+(define-data-var emergency-flag bool false)
 
 (define-map positions 
     principal 
@@ -37,6 +44,15 @@
 (define-map allowances 
     {owner: principal, spender: principal} 
     uint
+)
+
+(define-map stakers
+    principal
+    {
+        amount: uint,
+        reward-debt: uint,
+        last-block: uint
+    }
 )
 
 (define-private (is-contract-owner)
@@ -88,6 +104,37 @@
     (default-to u0 (map-get? allowances {owner: owner, spender: spender}))
 )
 
+(define-read-only (get-staked (user principal))
+    (match (map-get? stakers user)
+        staker-data (get amount staker-data)
+        u0
+    )
+)
+
+(define-read-only (get-pending-rewards (user principal))
+    (let ((staker-data (default-to {amount: u0, reward-debt: u0, last-block: u0} (map-get? stakers user)))
+          (total-staked-amount (var-get total-staked))
+          (blocks-elapsed (- stacks-block-height (get last-block staker-data))))
+        (if (and (> (get amount staker-data) u0) (> total-staked-amount u0) (> blocks-elapsed u0))
+            (let ((user-share (* (get amount staker-data) u1000000))
+                  (pool-share (/ user-share total-staked-amount))
+                  (block-rewards (* blocks-elapsed (var-get reward-rate-per-block)))
+                  (user-rewards (/ (* block-rewards pool-share) u1000000)))
+                (+ (get reward-debt staker-data) user-rewards))
+            (get reward-debt staker-data))))
+
+(define-read-only (get-total-staked)
+    (var-get total-staked)
+)
+
+(define-read-only (get-reward-rate)
+    (var-get reward-rate-per-block)
+)
+
+(define-read-only (get-emergency-status)
+    (var-get emergency-flag)
+)
+
 (define-private (transfer-token (from principal) (to principal) (amount uint))
     (let ((from-balance (get-balance from))
           (to-balance (get-balance to)))
@@ -96,6 +143,18 @@
         (map-set balances to (+ to-balance amount))
         (ok true)
     )
+)
+
+(define-private (update-user-rewards (user principal))
+    (let ((staker-data (default-to {amount: u0, reward-debt: u0, last-block: stacks-block-height} (map-get? stakers user)))
+          (pending (get-pending-rewards user)))
+        (map-set stakers user (merge staker-data {reward-debt: pending, last-block: stacks-block-height}))
+        (ok pending)
+    )
+)
+
+(define-private (is-vault-admin)
+    (is-eq tx-sender (var-get vault-admin))
 )
 
 (define-public (update-btc-price (new-price uint))
@@ -217,6 +276,106 @@
         (try! (transfer-token sender recipient amount))
         (map-set allowances {owner: sender, spender: tx-sender} (- allowance amount))
         (ok true)
+    )
+)
+
+(define-public (stake (amount uint))
+    (let ((current-staker (default-to {amount: u0, reward-debt: u0, last-block: stacks-block-height} (map-get? stakers tx-sender)))
+          (user-balance (get-balance tx-sender)))
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get emergency-flag)) ERR_EMERGENCY_ACTIVE)
+        (asserts! (<= amount user-balance) ERR_INSUFFICIENT_BALANCE)
+        (unwrap! (update-user-rewards tx-sender) ERR_UNAUTHORIZED)
+        (try! (transfer-token tx-sender (as-contract tx-sender) amount))
+        (map-set stakers tx-sender 
+            (merge current-staker 
+                {amount: (+ (get amount current-staker) amount), 
+                 last-block: stacks-block-height}))
+        (var-set total-staked (+ (var-get total-staked) amount))
+        (print {event: "stake", user: tx-sender, amount: amount})
+        (ok amount)
+    )
+)
+
+(define-public (unstake (amount uint))
+    (let ((staker-data (unwrap! (map-get? stakers tx-sender) ERR_POSITION_NOT_FOUND))
+          (pending-rewards (unwrap! (update-user-rewards tx-sender) ERR_UNAUTHORIZED)))
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get emergency-flag)) ERR_EMERGENCY_ACTIVE)
+        (asserts! (<= amount (get amount staker-data)) ERR_INSUFFICIENT_STAKE)
+        (try! (as-contract (transfer-token tx-sender tx-sender amount)))
+        (if (> pending-rewards u0)
+            (begin
+                (map-set balances tx-sender (+ (get-balance tx-sender) pending-rewards))
+                (var-set total-supply (+ (var-get total-supply) pending-rewards))
+                true)
+            true)
+        (let ((remaining-amount (- (get amount staker-data) amount)))
+            (if (is-eq remaining-amount u0)
+                (map-delete stakers tx-sender)
+                (map-set stakers tx-sender 
+                    (merge staker-data 
+                        {amount: remaining-amount, 
+                         reward-debt: u0, 
+                         last-block: stacks-block-height}))))
+        (var-set total-staked (- (var-get total-staked) amount))
+        (print {event: "unstake", user: tx-sender, amount: amount, rewards: pending-rewards})
+        (ok {unstaked: amount, rewards: pending-rewards})
+    )
+)
+
+(define-public (claim-rewards)
+    (let ((pending-rewards (unwrap! (update-user-rewards tx-sender) ERR_UNAUTHORIZED)))
+        (asserts! (> pending-rewards u0) ERR_INVALID_AMOUNT)
+        (asserts! (not (var-get emergency-flag)) ERR_EMERGENCY_ACTIVE)
+        (map-set balances tx-sender (+ (get-balance tx-sender) pending-rewards))
+        (var-set total-supply (+ (var-get total-supply) pending-rewards))
+        (let ((current-staker (unwrap! (map-get? stakers tx-sender) ERR_POSITION_NOT_FOUND)))
+            (map-set stakers tx-sender 
+                (merge current-staker 
+                    {reward-debt: u0, last-block: stacks-block-height})))
+        (print {event: "claim", user: tx-sender, rewards: pending-rewards})
+        (ok pending-rewards)
+    )
+)
+
+(define-public (emergency-unstake)
+    (let ((staker-data (unwrap! (map-get? stakers tx-sender) ERR_POSITION_NOT_FOUND)))
+        (asserts! (var-get emergency-flag) ERR_EMERGENCY_INACTIVE)
+        (try! (as-contract (transfer-token tx-sender tx-sender (get amount staker-data))))
+        (var-set total-staked (- (var-get total-staked) (get amount staker-data)))
+        (map-delete stakers tx-sender)
+        (print {event: "emergency-unstake", user: tx-sender, amount: (get amount staker-data)})
+        (ok (get amount staker-data))
+    )
+)
+
+(define-public (set-reward-rate (new-rate uint))
+    (begin
+        (asserts! (is-vault-admin) ERR_UNAUTHORIZED)
+        (asserts! (> new-rate u0) ERR_INVALID_AMOUNT)
+        (var-set reward-rate-per-block new-rate)
+        (print {event: "reward-rate-changed", new-rate: new-rate})
+        (ok new-rate)
+    )
+)
+
+(define-public (toggle-emergency)
+    (begin
+        (asserts! (is-vault-admin) ERR_UNAUTHORIZED)
+        (let ((current-status (var-get emergency-flag)))
+            (var-set emergency-flag (not current-status))
+            (print {event: "emergency-toggled", status: (not current-status)})
+            (ok (not current-status)))
+    )
+)
+
+(define-public (set-vault-admin (new-admin principal))
+    (begin
+        (asserts! (is-vault-admin) ERR_UNAUTHORIZED)
+        (var-set vault-admin new-admin)
+        (print {event: "vault-admin-changed", new-admin: new-admin})
+        (ok new-admin)
     )
 )
 
